@@ -7,7 +7,7 @@ const allocator = std.heap.page_allocator;
 const F = f64;
 const Complex = std.math.Complex(F);
 
-const block_size: usize = 480;
+const block_size: usize = 120;
 const size_x: usize = 16;  //multiplicated by block size
 const size_y: usize = 9;  //multiplicated by block size
 const real_size_x = size_x * block_size;
@@ -15,7 +15,6 @@ const real_size_y = size_y * block_size;
 const fsize_x = @intToFloat(F, real_size_x);
 const fsize_y = @intToFloat(F, real_size_y);
 
-const iterations: usize = 10000;
 var zoom: F = 5.15E-12;
 const zoom_inc: F = 0.98;
 const centerx: F = 0.281717921930775;
@@ -26,46 +25,39 @@ const black = Color32{ .r = 0, .g = 0, .b = 0, .a = 255 };
 const block_count = (size_x * size_y);
 var next_block: usize = 0;
 
+const multi_threaded: bool = true;
 
 pub fn main() anyerror!void {
     var frame: usize = 0;
 
-    const cores = 2 * try std.Thread.cpuCount();
-    //const cores: usize = 1;
+    const cores = if (multi_threaded) 2 * (try std.Thread.cpuCount()) else 1;
 
     std.debug.print("Starting render, using {} threads.\n", .{ cores });
-    var timer = try std.time.Timer.start();
 
     var img = try Image.init(allocator, real_size_x, real_size_y);
     defer img.deinit();
 
-    var threads = try allocator.alloc(*std.Thread, cores);
+    var ns = try renderFrame(cores, &img);
+
+    std.debug.print("Render took {}ms.\n", .{ns});
+}
+
+pub fn renderFrame(thread_count: usize, img: *Image) !u64 {
+    var timer = try std.time.Timer.start();
+    next_block = 0;
+
+    var threads = try allocator.alloc(*std.Thread, thread_count);
     defer allocator.free(threads);
 
-    while (frame != 1) : (frame += 1) {
-        next_block = 0;
-
-        std.debug.print("   - doing frame {}\n", .{frame});
-
-        for (threads) |*thread| {
-            thread.* = try std.Thread.spawn(img.data, renderBlock);
-        }
-        for (threads) |thread| {
-            thread.wait();
-        }
-
-        var buf: [15:0]u8 = undefined;
-        var thing = try std.fmt.bufPrint(&buf, "frame_{}.tga", .{frame});
-
-        try img.saveAsTGA(thing);
-
-        zoom = zoom * zoom_inc;
+    for (threads) |*thread| {
+        thread.* = try std.Thread.spawn(img.data, renderBlock);
+    }
+    for (threads) |thread| {
+        thread.wait();
     }
 
     var ns = timer.read();
-    ns /= 1_000_000;
-
-    std.debug.print("Render took {}ms.\n", .{ns});
+    return ns / 1_000_000;
 }
 
 
@@ -99,24 +91,14 @@ fn renderBlock(img: []Color32) void {
                 fy += centery;
 
                 var c = Complex.new(fx, fy);
-                var z = Complex.new(0, 0);
 
-                var max_mag: F = 0.0;
-
-                var i: usize = 0;
-                while (i < iterations and z.magnitude() <= 2.0) : (i += 1) {
-                    //z.re = std.math.fabs(z.re);
-                    //z.im = std.math.fabs(z.im);
-                    z = Complex.add(Complex.mul(z, z), c);
-                    max_mag = std.math.max(max_mag, z.magnitude());
-                }
-                var excess = max_mag - 2.0;
+                var p = checkPoint(c, 10000, false);
                 
-                if (i == iterations) {
+                if (p.in_the_set) {
                     img[px + py * real_size_x] = black;
                 }
                 else {
-                    img[px + py * real_size_x] = Color.fromHSV(@intToFloat(f32, (i * 1) % 360), 0.6, @sqrt(@floatCast(f32, excess / 2.0))).to32BitsColor();
+                    img[px + py * real_size_x] = Color.fromHSV(@intToFloat(f32, (p.total_iterations * 1) % 360), 0.6, @sqrt(@floatCast(f32, p.max_excess / 2.0))).to32BitsColor();
                 }
                 
             }
@@ -124,4 +106,32 @@ fn renderBlock(img: []Color32) void {
         //std.debug.print("Block number {} done!\n", .{ my_block });
     }
     //std.debug.print("No more blocks are availible for {}, dying.\n", .{ std.Thread.getCurrentId() });
+}
+
+const PointInfo = struct {
+    total_iterations: usize,
+    max_excess: F,
+    in_the_set: bool
+};
+
+fn checkPoint(c: Complex, iterations: usize, comptime burning_ship: bool) PointInfo {
+    var i: usize = 0;
+    var max_mag: F = 0.0;
+
+    var z = Complex.new(0, 0);
+    
+    while (i < iterations and z.magnitude() <= 2.0) : (i += 1) {
+        if (burning_ship) {
+            z.re = std.math.fabs(z.re);
+            z.im = std.math.fabs(z.im);
+        }
+        z = Complex.add(Complex.mul(z, z), c);
+        max_mag = std.math.max(max_mag, z.magnitude());
+    }
+
+    return PointInfo{
+        .total_iterations = i,
+        .max_excess = max_mag - 2.0,
+        .in_the_set = (i == iterations)
+    };
 }
